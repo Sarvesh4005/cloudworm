@@ -1,0 +1,5 @@
+# Local development & test dependencies only.
+# The Lambda runtime already provides boto3; nothing here is deployed.
+boto3>=1.35
+moto[server,s3,dynamodb]>=5.0
+pytest>=8.0

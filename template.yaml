@@ -1,0 +1,346 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  CloudWorm - end-to-end encrypted, Wormhole-style file transfer.
+  Private S3 + presigned URLs, DynamoDB metadata, Lambda (Python) behind an HTTP API,
+  and a React SPA served from CloudFront.
+
+Parameters:
+  UploadAccessCodeHash:
+    Type: String
+    NoEcho: true
+    AllowedPattern: "^[a-f0-9]{64}$"
+    ConstraintDescription: Lower-case hex SHA-256 of the upload access code (use scripts/hash-access-code.sh).
+    Description: SHA-256 (hex) of the shared upload access code. The plaintext code is never stored in AWS.
+  DevAllowedOrigin:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^https?://[a-zA-Z0-9.-]+(:[0-9]+)?$"
+    Description: Optional extra CORS origin for local frontend development, e.g. http://localhost:5173. Leave empty in production.
+  MaxFiles:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 500
+  MaxFileBytes:
+    Type: Number
+    Default: 2147483648 # 2 GiB (browsers without the File System Access API decrypt into memory)
+    MinValue: 1
+  MaxTransferBytes:
+    Type: Number
+    Default: 5368709120 # 5 GiB
+    MinValue: 1
+  ExpiryHoursOptions:
+    Type: String
+    Default: "1,24,72,168"
+    AllowedPattern: "^[0-9]+(,[0-9]+)*$"
+    Description: Comma-separated expiry choices offered to senders, in hours.
+  DefaultExpiryHours:
+    Type: Number
+    Default: 24
+  AllowedExtensions:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[a-zA-Z0-9]+(,[a-zA-Z0-9]+)*$"
+    Description: Optional comma-separated allowlist (e.g. "pdf,png,zip"). Empty = all types.
+  ObjectRetentionDays:
+    Type: Number
+    Default: 8
+    MinValue: 1
+    Description: S3 lifecycle cleanup age. Must exceed the longest expiry option. Cleanup only - expiry is enforced in code.
+  ApiRateLimit:
+    Type: Number
+    Default: 10
+    Description: Steady-state requests/second allowed per route.
+  ApiBurstLimit:
+    Type: Number
+    Default: 20
+  BudgetAlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional. If set, creates a monthly AWS Budget that emails this address.
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 5
+
+Conditions:
+  HasDevOrigin: !Not [!Equals [!Ref DevAllowedOrigin, ""]]
+  HasBudgetEmail: !Not [!Equals [!Ref BudgetAlertEmail, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures: [arm64]
+    MemorySize: 256
+    Timeout: 15
+    CodeUri: backend/src/
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref TransfersTable
+        BUCKET_NAME: !Ref FilesBucket
+        ACCESS_CODE_HASH: !Ref UploadAccessCodeHash
+        MAX_FILES: !Ref MaxFiles
+        MAX_FILE_BYTES: !Ref MaxFileBytes
+        MAX_TRANSFER_BYTES: !Ref MaxTransferBytes
+        EXPIRY_HOURS_OPTIONS: !Ref ExpiryHoursOptions
+        DEFAULT_EXPIRY_HOURS: !Ref DefaultExpiryHours
+        ALLOWED_EXTENSIONS: !Ref AllowedExtensions
+        UPLOAD_URL_TTL_SECONDS: "900"
+        DOWNLOAD_URL_TTL_SECONDS: "300"
+
+Resources:
+  # ---------------------------------------------------------------- storage --
+  FilesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # Deterministic name so the CSP below can reference it without a dependency cycle.
+      BucketName: !Sub "${AWS::StackName}-files-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+            BucketKeyEnabled: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: !If
+              - HasDevOrigin
+              - [!Sub "https://${Distribution.DomainName}", !Ref DevAllowedOrigin]
+              - [!Sub "https://${Distribution.DomainName}"]
+            AllowedMethods: [GET, PUT]
+            AllowedHeaders: ["*"]
+            ExposedHeaders: [ETag]
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-multipart
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 }
+          - Id: expire-transfers-cleanup-only
+            Status: Enabled
+            Prefix: transfers/
+            ExpirationInDays: !Ref ObjectRetentionDays
+
+  FilesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FilesBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt FilesBucket.Arn, !Sub "${FilesBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  TransfersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: transferId, AttributeType: S }]
+      KeySchema: [{ AttributeName: transferId, KeyType: HASH }]
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true } # cleanup only
+      SSESpecification: { SSEEnabled: true }
+
+  # --------------------------------------------------------------------- API --
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      FailOnWarnings: true
+      CorsConfiguration:
+        AllowOrigins: !If
+          - HasDevOrigin
+          - [!Sub "https://${Distribution.DomainName}", !Ref DevAllowedOrigin]
+          - [!Sub "https://${Distribution.DomainName}"]
+        AllowMethods: [GET, POST, DELETE]
+        AllowHeaders: [content-type, x-owner-token]
+        MaxAge: 600
+      DefaultRouteSettings:
+        ThrottlingRateLimit: !Ref ApiRateLimit
+        ThrottlingBurstLimit: !Ref ApiBurstLimit
+
+  SenderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Create transfers, presign uploads, verify, finalize, delete.
+      Handler: cloudworm.sender.handler
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource: !GetAtt TransfersTable.Arn
+            - Effect: Allow
+              # PutObject also covers Create/UploadPart/CompleteMultipartUpload;
+              # GetObject is needed for HeadObject size verification.
+              Action: [s3:PutObject, s3:GetObject, s3:DeleteObject, s3:AbortMultipartUpload]
+              Resource: !Sub "${FilesBucket.Arn}/transfers/*"
+      Events:
+        Create: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /transfers } }
+        UploadUrls: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: "/transfers/{transferId}/files/{fileIndex}/upload-urls" } }
+        Complete: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: "/transfers/{transferId}/files/{fileIndex}/complete" } }
+        Finalize: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: "/transfers/{transferId}/finalize" } }
+        Delete: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: DELETE, Path: "/transfers/{transferId}" } }
+
+  ReceiverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Public config, transfer metadata and short-lived download URLs.
+      Handler: cloudworm.receiver.handler
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource: !GetAtt TransfersTable.Arn
+            - Effect: Allow
+              Action: [s3:GetObject]
+              Resource: !Sub "${FilesBucket.Arn}/transfers/*"
+      Events:
+        Config: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /config } }
+        Get: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: "/transfers/{transferId}" } }
+        DownloadUrl: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: "/transfers/{transferId}/files/{fileIndex}/download-url" } }
+
+  SenderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${SenderFunction}"
+      RetentionInDays: 14
+  ReceiverLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ReceiverFunction}"
+      RetentionInDays: 14
+
+  # ---------------------------------------------------------------- frontend --
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt SiteBucket.Arn, !Sub "${SiteBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  SiteOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-site-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SecurityHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub "${AWS::StackName}-security-headers"
+        SecurityHeadersConfig:
+          ContentSecurityPolicy:
+            Override: true
+            ContentSecurityPolicy: !Sub >-
+              default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
+              img-src 'self' data: blob:; font-src 'self';
+              connect-src 'self' https://*.execute-api.${AWS::Region}.amazonaws.com
+              https://${AWS::StackName}-files-${AWS::AccountId}.s3.${AWS::Region}.amazonaws.com;
+              object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'
+          StrictTransportSecurity: { Override: true, AccessControlMaxAgeSec: 31536000, IncludeSubdomains: true }
+          ContentTypeOptions: { Override: true }
+          FrameOptions: { Override: true, FrameOption: DENY }
+          # The transfer ID is in the path; never leak it to other sites.
+          ReferrerPolicy: { Override: true, ReferrerPolicy: no-referrer }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: CloudWorm frontend
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_200 # includes India / Asia edge locations
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOAC.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods: [GET, HEAD]
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+          ResponseHeadersPolicyId: !Ref SecurityHeaders
+        # SPA routing: /t/<id> is served by index.html.
+        CustomErrorResponses:
+          - { ErrorCode: 403, ResponseCode: 200, ResponsePagePath: /index.html, ErrorCachingMinTTL: 0 }
+          - { ErrorCode: 404, ResponseCode: 200, ResponsePagePath: /index.html, ErrorCachingMinTTL: 0 }
+
+  # ------------------------------------------------------------ cost control --
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Condition: HasBudgetEmail
+    Properties:
+      Budget:
+        BudgetName: !Sub "${AWS::StackName}-monthly"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref MonthlyBudgetUsd, Unit: USD }
+      NotificationsWithSubscribers:
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 50, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref BudgetAlertEmail }]
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref BudgetAlertEmail }]
+        - Notification: { NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref BudgetAlertEmail }]
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the HTTP API (VITE_API_URL)
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  SiteUrl:
+    Description: Public URL of the frontend
+    Value: !Sub "https://${Distribution.DomainName}"
+  SiteBucketName:
+    Value: !Ref SiteBucket
+  DistributionId:
+    Value: !Ref Distribution
+  FilesBucketName:
+    Value: !Ref FilesBucket
+  TransfersTableName:
+    Value: !Ref TransfersTable

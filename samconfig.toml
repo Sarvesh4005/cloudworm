@@ -1,0 +1,19 @@
+# Non-secret defaults for `sam` commands. The access-code hash is passed at deploy
+# time by scripts/deploy-backend.sh and is never written here.
+version = 0.1
+
+[default.global.parameters]
+stack_name = "cloudworm"
+region = "ap-south-1"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+confirm_changeset = true
+
+[default.validate.parameters]
+lint = true
