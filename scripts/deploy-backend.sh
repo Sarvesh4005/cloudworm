@@ -12,13 +12,12 @@ REGION="${AWS_REGION:-ap-south-1}"
 
 hash="$(scripts/hash-access-code.sh)"
 
-overrides=(
-  "UploadAccessCodeHash=$hash"
-  "DevAllowedOrigin=${DEV_ORIGIN:-}"
-  "BudgetAlertEmail=${BUDGET_EMAIL:-}"
-  "MonthlyBudgetUsd=${BUDGET_USD:-5}"
-  "AllowedExtensions=${ALLOWED_EXTENSIONS:-}"
-)
+# SAM rejects empty "Key=" overrides, so only pass settings that have a value;
+# everything else falls back to the template defaults.
+overrides=("UploadAccessCodeHash=$hash" "MonthlyBudgetUsd=${BUDGET_USD:-5}")
+[[ -n "${DEV_ORIGIN:-}" ]] && overrides+=("DevAllowedOrigin=$DEV_ORIGIN")
+[[ -n "${BUDGET_EMAIL:-}" ]] && overrides+=("BudgetAlertEmail=$BUDGET_EMAIL")
+[[ -n "${ALLOWED_EXTENSIONS:-}" ]] && overrides+=("AllowedExtensions=$ALLOWED_EXTENSIONS")
 
 if command -v python3.13 >/dev/null; then
   sam build
