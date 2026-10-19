@@ -55,6 +55,14 @@ Parameters:
   ApiBurstLimit:
     Type: Number
     Default: 20
+  EnableCloudFront:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Host the frontend on S3 + CloudFront. Set "false" while a new AWS account is still
+      waiting for CloudFront verification; then DevAllowedOrigin must be set and the
+      frontend runs locally against this API.
   BudgetAlertEmail:
     Type: String
     Default: ""
@@ -66,6 +74,15 @@ Parameters:
 Conditions:
   HasDevOrigin: !Not [!Equals [!Ref DevAllowedOrigin, ""]]
   HasBudgetEmail: !Not [!Equals [!Ref BudgetAlertEmail, ""]]
+  HasCloudFront: !Equals [!Ref EnableCloudFront, "true"]
+
+Rules:
+  # Without CloudFront the only browser origin is DevAllowedOrigin; never deploy with none.
+  OriginRequiredWithoutCloudFront:
+    RuleCondition: !Equals [!Ref EnableCloudFront, "false"]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref DevAllowedOrigin, ""]]
+        AssertDescription: DevAllowedOrigin is required when EnableCloudFront is "false".
 
 Globals:
   Function:
@@ -109,9 +126,12 @@ Resources:
       CorsConfiguration:
         CorsRules:
           - AllowedOrigins: !If
-              - HasDevOrigin
-              - [!Sub "https://${Distribution.DomainName}", !Ref DevAllowedOrigin]
-              - [!Sub "https://${Distribution.DomainName}"]
+              - HasCloudFront
+              - !If
+                - HasDevOrigin
+                - [!Sub "https://${Distribution.DomainName}", !Ref DevAllowedOrigin]
+                - [!Sub "https://${Distribution.DomainName}"]
+              - [!Ref DevAllowedOrigin]
             AllowedMethods: [GET, PUT]
             AllowedHeaders: ["*"]
             ExposedHeaders: [ETag]
@@ -156,9 +176,12 @@ Resources:
       FailOnWarnings: true
       CorsConfiguration:
         AllowOrigins: !If
-          - HasDevOrigin
-          - [!Sub "https://${Distribution.DomainName}", !Ref DevAllowedOrigin]
-          - [!Sub "https://${Distribution.DomainName}"]
+          - HasCloudFront
+          - !If
+            - HasDevOrigin
+            - [!Sub "https://${Distribution.DomainName}", !Ref DevAllowedOrigin]
+            - [!Sub "https://${Distribution.DomainName}"]
+          - [!Ref DevAllowedOrigin]
         AllowMethods: [GET, POST, DELETE]
         AllowHeaders: [content-type, x-owner-token]
         MaxAge: 600
@@ -222,6 +245,7 @@ Resources:
   # ---------------------------------------------------------------- frontend --
   SiteBucket:
     Type: AWS::S3::Bucket
+    Condition: HasCloudFront
     Properties:
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
@@ -236,6 +260,7 @@ Resources:
 
   SiteBucketPolicy:
     Type: AWS::S3::BucketPolicy
+    Condition: HasCloudFront
     Properties:
       Bucket: !Ref SiteBucket
       PolicyDocument:
@@ -258,6 +283,7 @@ Resources:
 
   SiteOAC:
     Type: AWS::CloudFront::OriginAccessControl
+    Condition: HasCloudFront
     Properties:
       OriginAccessControlConfig:
         Name: !Sub "${AWS::StackName}-site-oac"
@@ -267,6 +293,7 @@ Resources:
 
   SecurityHeaders:
     Type: AWS::CloudFront::ResponseHeadersPolicy
+    Condition: HasCloudFront
     Properties:
       ResponseHeadersPolicyConfig:
         Name: !Sub "${AWS::StackName}-security-headers"
@@ -287,6 +314,7 @@ Resources:
 
   Distribution:
     Type: AWS::CloudFront::Distribution
+    Condition: HasCloudFront
     Properties:
       DistributionConfig:
         Enabled: true
@@ -334,11 +362,14 @@ Outputs:
     Description: Base URL of the HTTP API (VITE_API_URL)
     Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
   SiteUrl:
+    Condition: HasCloudFront
     Description: Public URL of the frontend
     Value: !Sub "https://${Distribution.DomainName}"
   SiteBucketName:
+    Condition: HasCloudFront
     Value: !Ref SiteBucket
   DistributionId:
+    Condition: HasCloudFront
     Value: !Ref Distribution
   FilesBucketName:
     Value: !Ref FilesBucket

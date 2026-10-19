@@ -14,6 +14,12 @@ BUCKET="$(output SiteBucketName)"
 DIST_ID="$(output DistributionId)"
 SITE_URL="$(output SiteUrl)"
 
+if [[ -z "$BUCKET" || "$BUCKET" == "None" ]]; then
+  echo "This stack has no CloudFront site (EnableCloudFront=false)." >&2
+  echo "Run the frontend locally instead: set VITE_API_URL=$API_URL in frontend/.env.local, then npm --prefix frontend run dev" >&2
+  exit 1
+fi
+
 echo "VITE_API_URL=$API_URL" > frontend/.env.production
 npm --prefix frontend ci
 npm --prefix frontend run build

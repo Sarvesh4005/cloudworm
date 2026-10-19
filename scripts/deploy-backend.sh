@@ -5,6 +5,8 @@
 #   DEV_ORIGIN   e.g. http://localhost:5173 to let a local frontend call the deployed API
 #   BUDGET_EMAIL address for AWS Budget alerts   BUDGET_USD (default 5)
 #   ALLOWED_EXTENSIONS e.g. "pdf,png,zip" (empty = all)
+#   ENABLE_CLOUDFRONT=false  skip the CloudFront site (needs DEV_ORIGIN), e.g. while a
+#                            new account awaits CloudFront verification
 set -euo pipefail
 cd "$(dirname "$0")/.."
 STACK_NAME="${STACK_NAME:-cloudworm}"
@@ -18,6 +20,7 @@ overrides=("UploadAccessCodeHash=$hash" "MonthlyBudgetUsd=${BUDGET_USD:-5}")
 [[ -n "${DEV_ORIGIN:-}" ]] && overrides+=("DevAllowedOrigin=$DEV_ORIGIN")
 [[ -n "${BUDGET_EMAIL:-}" ]] && overrides+=("BudgetAlertEmail=$BUDGET_EMAIL")
 [[ -n "${ALLOWED_EXTENSIONS:-}" ]] && overrides+=("AllowedExtensions=$ALLOWED_EXTENSIONS")
+[[ "${ENABLE_CLOUDFRONT:-true}" == "false" ]] && overrides+=("EnableCloudFront=false")
 
 if command -v python3.13 >/dev/null; then
   sam build
