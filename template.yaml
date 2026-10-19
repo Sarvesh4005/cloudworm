@@ -174,17 +174,24 @@ Resources:
     Type: AWS::Serverless::HttpApi
     Properties:
       FailOnWarnings: true
-      CorsConfiguration:
-        AllowOrigins: !If
-          - HasCloudFront
-          - !If
-            - HasDevOrigin
-            - [!Sub "https://${Distribution.DomainName}", !Ref DevAllowedOrigin]
-            - [!Sub "https://${Distribution.DomainName}"]
-          - [!Ref DevAllowedOrigin]
-        AllowMethods: [GET, POST, DELETE]
-        AllowHeaders: [content-type, x-owner-token]
-        MaxAge: 600
+      # SAM only accepts a condition around the *whole* CORS object for HTTP APIs;
+      # an Fn::If inside AllowOrigins is misread as the entire configuration.
+      CorsConfiguration: !If
+        - HasCloudFront
+        - !If
+          - HasDevOrigin
+          - AllowOrigins: [!Sub "https://${Distribution.DomainName}", !Ref DevAllowedOrigin]
+            AllowMethods: [GET, POST, DELETE]
+            AllowHeaders: [content-type, x-owner-token]
+            MaxAge: 600
+          - AllowOrigins: [!Sub "https://${Distribution.DomainName}"]
+            AllowMethods: [GET, POST, DELETE]
+            AllowHeaders: [content-type, x-owner-token]
+            MaxAge: 600
+        - AllowOrigins: [!Ref DevAllowedOrigin]
+          AllowMethods: [GET, POST, DELETE]
+          AllowHeaders: [content-type, x-owner-token]
+          MaxAge: 600
       DefaultRouteSettings:
         ThrottlingRateLimit: !Ref ApiRateLimit
         ThrottlingBurstLimit: !Ref ApiBurstLimit
