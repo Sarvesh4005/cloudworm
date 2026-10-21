@@ -138,6 +138,7 @@ Browser ──(JSON)──► API Gateway ──► Lambda ──► DynamoDB (m
 │   │   ├── http.py             # API Gateway v2 event helpers, error envelope
 │   │   ├── sender.py           # create / upload-urls / complete / finalize / delete
 │   │   └── receiver.py         # config / metadata / download-url
+│   ├── site/cloudworm_site.py  # SiteHosting=api: serves the built app from the API
 │   ├── local/dev_server.py     # runs the real handlers + moto S3/DynamoDB offline
 │   ├── tests/                  # pytest unit tests (moto) + integration/test_live_api.py
 │   ├── requirements-dev.txt
@@ -182,8 +183,27 @@ The owner token travels in the `x-owner-token` header. Errors look like
 | `AllowedExtensions` | empty (all types) | e.g. `pdf,png,zip` |
 | `ObjectRetentionDays` | 8 | Lifecycle cleanup; must exceed the longest expiry |
 | `ApiRateLimit` / `ApiBurstLimit` | 10 / 20 | Per route |
-| `DevAllowedOrigin` | empty | e.g. `http://localhost:5173` for local frontend + cloud API |
+| `SiteHosting` | `cloudfront` | `cloudfront`, `api` or `none`; see [Hosting modes](#hosting-modes) |
+| `DevAllowedOrigin` | empty | e.g. `http://localhost:5173` for local frontend + cloud API. Required when `SiteHosting=none` |
 | `BudgetAlertEmail` / `MonthlyBudgetUsd` | empty / 5 | Creates an AWS Budget when the email is set |
+
+### Hosting modes
+
+| `SiteHosting` | Where the app is served | When to use it |
+|---|---|---|
+| `cloudfront` (default) | Private S3 bucket behind CloudFront, with security headers | Normal production setup |
+| `api` | A small `SiteFunction` Lambda serves the built app from the HTTP API's own HTTPS URL. The app and API share one origin, so the API needs no CORS. | New AWS accounts are blocked from creating CloudFront distributions until AWS Support verifies them. This mode needs no CloudFront. |
+| `none` | No hosted site; the frontend runs on your Mac against the deployed API | Backend-only testing. Requires `DevAllowedOrigin`, and share links only work on your machine. |
+
+In `api` mode:
+- Only the small static bundle (~350 KB) goes through Lambda. Files still go directly
+  between the browser and S3.
+- The Lambda adds the same security headers that CloudFront would: CSP, HSTS,
+  `no-referrer` and `X-Frame-Options: DENY`.
+- The trade-offs are a long `execute-api` URL, an occasional cold start of about half
+  a second, and page loads counting toward the API's rate limit.
+- Moving to CloudFront later takes one redeploy with `SITE_HOSTING=cloudfront`,
+  followed by `scripts/deploy-frontend.sh`.
 
 ---
 
@@ -247,6 +267,20 @@ link you get back in another tab.
 > - To run the local frontend against the **deployed** API instead, deploy with
 >   `DEV_ORIGIN=http://localhost:5173`. Then set `VITE_API_URL` in
 >   `frontend/.env.local` to the stack's `ApiUrl`.
+
+**Trying the `SiteHosting=api` setup offline.** In this mode the backend serves the app
+itself, on one origin, with the real security headers. Build the frontend in
+same-origin mode:
+
+```bash
+VITE_API_URL=same-origin npm --prefix frontend run build
+```
+
+Then start the backend with site serving turned on, and open http://127.0.0.1:3001:
+
+```bash
+CLOUDWORM_SERVE_SITE=1 scripts/dev-backend.sh
+```
 
 ## 3. Tests
 
@@ -347,6 +381,28 @@ scripts/deploy-frontend.sh
 Open the printed `SiteUrl`. To change settings, or to **rotate the access code**,
 rerun `scripts/deploy-backend.sh`.
 
+**If AWS says "Your account must be verified before you can add new CloudFront
+resources":**
+- This is a restriction on new AWS accounts. Open a free support case under
+  **Account and billing** asking AWS to verify the account for CloudFront.
+- Meanwhile, deploy with the API serving the site. The script builds the frontend and
+  bundles it automatically, so you don't run `deploy-frontend.sh` in this mode:
+  ```bash
+  SITE_HOSTING=api BUDGET_EMAIL=you@example.com scripts/deploy-backend.sh
+  ```
+- If a failed first deploy left the stack in `ROLLBACK_COMPLETE`, delete that empty
+  stack record first:
+  ```bash
+  aws cloudformation delete-stack --stack-name cloudworm --region ap-south-1
+  ```
+- After AWS verifies the account, switch to CloudFront:
+  ```bash
+  SITE_HOSTING=cloudfront BUDGET_EMAIL=you@example.com scripts/deploy-backend.sh
+  ```
+  ```bash
+  scripts/deploy-frontend.sh
+  ```
+
 **Viewing logs:**
 
 ```bash
@@ -434,6 +490,8 @@ aws sts get-caller-identity
 openssl rand -base64 18                                  # your upload access code, save it
 BUDGET_EMAIL=you@example.com scripts/deploy-backend.sh  # prompts for the code
 scripts/deploy-frontend.sh                               # prints your SiteUrl
+# (account not yet verified for CloudFront? instead run:)
+SITE_HOSTING=api BUDGET_EMAIL=you@example.com scripts/deploy-backend.sh   # site served by the API
 
 # --- after deploying ---
 sam logs --stack-name cloudworm --region ap-south-1 --tail
@@ -453,3 +511,5 @@ scripts/destroy.sh
 | Large download fails on iPhone / Safari | Non-Chromium browsers decrypt into memory. Use desktop Chrome or Edge for very large files, or lower `MaxFileBytes`. |
 | `sam build` complains about the Python version | `brew install python@3.13`, or let the deploy script skip the build. The Lambdas have no third-party dependencies. |
 | Site shows old content after deploy | Wait a minute for the CloudFront invalidation, then hard-refresh. |
+| "Your account must be verified before you can add new CloudFront resources" | Open an AWS Support case (Account and billing), and deploy with `SITE_HOSTING=api` meanwhile. See [Deploy to AWS](#4-deploy-to-aws). |
+| "CloudWorm site bundle is missing" (`SiteHosting=api`) | Deploy through `scripts/deploy-backend.sh`, which builds the frontend into `backend/site/dist`, rather than plain `sam deploy`. |

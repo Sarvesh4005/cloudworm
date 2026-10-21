@@ -131,6 +131,15 @@ export function createApi(baseUrl: string, fetchImpl: FetchLike = (...a) => fetc
 
 export type Api = ReturnType<typeof createApi>;
 
-export const api: Api = createApi(import.meta.env.VITE_API_URL ?? "");
+/**
+ * VITE_API_URL is either an absolute API base URL, or "same-origin" when the app is
+ * served by the API itself (SiteHosting=api), so the browser calls its own origin.
+ */
+export function resolveApiBase(configured: string | undefined, origin?: string): string {
+  if (configured === "same-origin") return origin ?? (typeof window === "undefined" ? "" : window.location.origin);
+  return configured ?? "";
+}
+
+export const api: Api = createApi(resolveApiBase(import.meta.env.VITE_API_URL));
 
 export const TRANSFER_ID_RE = /^[A-Za-z0-9_-]{22}$/;

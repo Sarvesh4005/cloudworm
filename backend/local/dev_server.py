@@ -7,6 +7,12 @@ No AWS account, credentials or Docker required. Data is lost on exit.
     cd backend && .venv/bin/python local/dev_server.py
 
 Then run the frontend with VITE_API_URL=http://localhost:3001.
+
+To test SiteHosting=api (the app served by the API itself, same origin), build the
+frontend with VITE_API_URL=same-origin and open http://127.0.0.1:3001 instead:
+
+    VITE_API_URL=same-origin npm --prefix frontend run build
+    CLOUDWORM_SERVE_SITE=1 backend/.venv/bin/python backend/local/dev_server.py
 """
 from __future__ import annotations
 
@@ -19,12 +25,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "backend" / "src"))
+sys.path.insert(0, str(ROOT / "backend" / "site"))
+SERVE_SITE = os.environ.get("CLOUDWORM_SERVE_SITE") == "1"
+if SERVE_SITE:
+    os.environ.setdefault("SITE_DIST_DIR", str(ROOT / "frontend" / "dist"))
+    os.environ.setdefault("FILES_BUCKET_ORIGIN", f"http://127.0.0.1:{os.environ.get('CLOUDWORM_MOTO_PORT', '5005')}")
 
 API_PORT = int(os.environ.get("CLOUDWORM_API_PORT", "3001"))
 MOTO_PORT = int(os.environ.get("CLOUDWORM_MOTO_PORT", "5005"))
 ACCESS_CODE = os.environ.get("CLOUDWORM_LOCAL_ACCESS_CODE", "local-dev-code")  # local only, never deployed
-ALLOWED_ORIGINS = {"http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:4173"}
+ALLOWED_ORIGINS = {"http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:4173",
+                   # SiteHosting=api emulation: the app is served from the API's own origin.
+                   f"http://127.0.0.1:{API_PORT}", f"http://localhost:{API_PORT}"}
 REGION = "ap-south-1"
 BUCKET = "cloudworm-local-files"
 TABLE = "cloudworm-local-transfers"
@@ -46,6 +60,9 @@ os.environ.update(
 import boto3  # noqa: E402
 from moto.server import ThreadedMotoServer  # noqa: E402
 
+import base64  # noqa: E402
+
+import cloudworm_site  # noqa: E402
 from cloudworm import receiver, sender  # noqa: E402
 
 ROUTES = [(m, re.compile("^" + re.sub(r"\{(\w+)\}", r"(?P<\1>[^/]+)", p) + "$"), f"{m} {p}", mod) for m, p, mod in [
@@ -116,9 +133,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = module.handler(event)
                 break
         else:
+            result = None
+        if result is None and SERVE_SITE and self.command == "GET":
+            # Mirrors the HTTP API's GET / and GET /{proxy+} routes to the site Lambda.
+            result = cloudworm_site.handler({"rawPath": path})
+        if result is None:
             result = {"statusCode": 404, "headers": {"content-type": "application/json"},
                       "body": json.dumps({"error": {"code": "route_not_found", "message": "Unknown API route."}})}
-        payload = result["body"].encode()
+        payload = base64.b64decode(result["body"]) if result.get("isBase64Encoded") else result["body"].encode()
         self.send_response(result["statusCode"])
         for k, v in result.get("headers", {}).items():
             self.send_header(k, v)
@@ -155,6 +177,8 @@ def main() -> None:
     print(f"CloudWorm local API  : http://localhost:{API_PORT}")
     print(f"Emulated S3/DynamoDB : http://localhost:{MOTO_PORT} (moto, in-memory)")
     print(f"Upload access code   : {ACCESS_CODE}   (local only)")
+    if SERVE_SITE:
+        print(f"Same-origin site     : http://127.0.0.1:{API_PORT}  (from {os.environ['SITE_DIST_DIR']})")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

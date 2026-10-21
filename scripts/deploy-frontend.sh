@@ -15,8 +15,12 @@ DIST_ID="$(output DistributionId)"
 SITE_URL="$(output SiteUrl)"
 
 if [[ -z "$BUCKET" || "$BUCKET" == "None" ]]; then
-  echo "This stack has no CloudFront site (EnableCloudFront=false)." >&2
-  echo "Run the frontend locally instead: set VITE_API_URL=$API_URL in frontend/.env.local, then npm --prefix frontend run dev" >&2
+  case "$(output SiteHosting)" in
+    api) echo "This stack serves the app from the API itself ($SITE_URL)." >&2
+         echo "To update it, rerun: SITE_HOSTING=api scripts/deploy-backend.sh" >&2 ;;
+    *)   echo "This stack has no hosted site (SiteHosting=none)." >&2
+         echo "Run the frontend locally: set VITE_API_URL=$API_URL in frontend/.env.local, then npm --prefix frontend run dev" >&2 ;;
+  esac
   exit 1
 fi
 

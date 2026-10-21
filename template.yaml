@@ -55,14 +55,15 @@ Parameters:
   ApiBurstLimit:
     Type: Number
     Default: 20
-  EnableCloudFront:
+  SiteHosting:
     Type: String
-    Default: "true"
-    AllowedValues: ["true", "false"]
+    Default: cloudfront
+    AllowedValues: [cloudfront, api, none]
     Description: >
-      Host the frontend on S3 + CloudFront. Set "false" while a new AWS account is still
-      waiting for CloudFront verification; then DevAllowedOrigin must be set and the
-      frontend runs locally against this API.
+      Where the frontend is served. "cloudfront" = private S3 + CloudFront (best).
+      "api" = a small Lambda serves it from this HTTP API's own HTTPS URL (for accounts
+      still awaiting CloudFront verification). "none" = run the frontend locally
+      (requires DevAllowedOrigin).
   BudgetAlertEmail:
     Type: String
     Default: ""
@@ -74,15 +75,17 @@ Parameters:
 Conditions:
   HasDevOrigin: !Not [!Equals [!Ref DevAllowedOrigin, ""]]
   HasBudgetEmail: !Not [!Equals [!Ref BudgetAlertEmail, ""]]
-  HasCloudFront: !Equals [!Ref EnableCloudFront, "true"]
+  HasCloudFront: !Equals [!Ref SiteHosting, cloudfront]
+  HasApiSite: !Equals [!Ref SiteHosting, api]
+  HasSite: !Or [!Condition HasCloudFront, !Condition HasApiSite]
 
 Rules:
-  # Without CloudFront the only browser origin is DevAllowedOrigin; never deploy with none.
-  OriginRequiredWithoutCloudFront:
-    RuleCondition: !Equals [!Ref EnableCloudFront, "false"]
+  # With no hosted site the only browser origin is DevAllowedOrigin; never deploy with none.
+  OriginRequiredWithoutSite:
+    RuleCondition: !Equals [!Ref SiteHosting, none]
     Assertions:
       - Assert: !Not [!Equals [!Ref DevAllowedOrigin, ""]]
-        AssertDescription: DevAllowedOrigin is required when EnableCloudFront is "false".
+        AssertDescription: DevAllowedOrigin is required when SiteHosting is "none".
 
 Globals:
   Function:
@@ -94,7 +97,9 @@ Globals:
     Environment:
       Variables:
         TABLE_NAME: !Ref TransfersTable
-        BUCKET_NAME: !Ref FilesBucket
+        # Bucket name by string, not Ref, so the functions don't depend on the bucket and the
+        # bucket's CORS can reference the API's URL (SiteHosting=api) without a cycle.
+        BUCKET_NAME: !Sub "${AWS::StackName}-files-${AWS::AccountId}"
         ACCESS_CODE_HASH: !Ref UploadAccessCodeHash
         MAX_FILES: !Ref MaxFiles
         MAX_FILE_BYTES: !Ref MaxFileBytes
@@ -125,13 +130,15 @@ Resources:
             BucketKeyEnabled: true
       CorsConfiguration:
         CorsRules:
-          - AllowedOrigins: !If
-              - HasCloudFront
+          - AllowedOrigins:
               - !If
-                - HasDevOrigin
-                - [!Sub "https://${Distribution.DomainName}", !Ref DevAllowedOrigin]
-                - [!Sub "https://${Distribution.DomainName}"]
-              - [!Ref DevAllowedOrigin]
+                - HasCloudFront
+                - !Sub "https://${Distribution.DomainName}"
+                - !If
+                  - HasApiSite
+                  - !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+                  - !Ref AWS::NoValue
+              - !If [HasDevOrigin, !Ref DevAllowedOrigin, !Ref AWS::NoValue]
             AllowedMethods: [GET, PUT]
             AllowedHeaders: ["*"]
             ExposedHeaders: [ETag]
@@ -188,10 +195,14 @@ Resources:
             AllowMethods: [GET, POST, DELETE]
             AllowHeaders: [content-type, x-owner-token]
             MaxAge: 600
-        - AllowOrigins: [!Ref DevAllowedOrigin]
-          AllowMethods: [GET, POST, DELETE]
-          AllowHeaders: [content-type, x-owner-token]
-          MaxAge: 600
+        # SiteHosting=api/none: the hosted site is same-origin, so only a dev origin needs CORS.
+        - !If
+          - HasDevOrigin
+          - AllowOrigins: [!Ref DevAllowedOrigin]
+            AllowMethods: [GET, POST, DELETE]
+            AllowHeaders: [content-type, x-owner-token]
+            MaxAge: 600
+          - !Ref AWS::NoValue
       DefaultRouteSettings:
         ThrottlingRateLimit: !Ref ApiRateLimit
         ThrottlingBurstLimit: !Ref ApiBurstLimit
@@ -211,7 +222,7 @@ Resources:
               # PutObject also covers Create/UploadPart/CompleteMultipartUpload;
               # GetObject is needed for HeadObject size verification.
               Action: [s3:PutObject, s3:GetObject, s3:DeleteObject, s3:AbortMultipartUpload]
-              Resource: !Sub "${FilesBucket.Arn}/transfers/*"
+              Resource: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-files-${AWS::AccountId}/transfers/*"
       Events:
         Create: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: /transfers } }
         UploadUrls: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: "/transfers/{transferId}/files/{fileIndex}/upload-urls" } }
@@ -232,11 +243,29 @@ Resources:
               Resource: !GetAtt TransfersTable.Arn
             - Effect: Allow
               Action: [s3:GetObject]
-              Resource: !Sub "${FilesBucket.Arn}/transfers/*"
+              Resource: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-files-${AWS::AccountId}/transfers/*"
       Events:
         Config: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: /config } }
         Get: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: "/transfers/{transferId}" } }
         DownloadUrl: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: POST, Path: "/transfers/{transferId}/files/{fileIndex}/download-url" } }
+
+  SiteFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasApiSite
+    Properties:
+      Description: Serves the static React app from the HTTP API (SiteHosting=api).
+      CodeUri: backend/site/
+      Handler: cloudworm_site.handler
+      MemorySize: 128
+      Timeout: 5
+      Environment:
+        Variables:
+          FILES_BUCKET_HOST: !Sub "${AWS::StackName}-files-${AWS::AccountId}.s3.${AWS::Region}.amazonaws.com"
+      # No Policies: it only reads its own bundled files (basic logging role only).
+      Events:
+        # More specific API routes (/config, /transfers/...) always win over these.
+        Root: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: / } }
+        Assets: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Method: GET, Path: "/{proxy+}" } }
 
   SenderLogGroup:
     Type: AWS::Logs::LogGroup
@@ -247,6 +276,12 @@ Resources:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/aws/lambda/${ReceiverFunction}"
+      RetentionInDays: 14
+  SiteLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasApiSite
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${SiteFunction}"
       RetentionInDays: 14
 
   # ---------------------------------------------------------------- frontend --
@@ -369,9 +404,14 @@ Outputs:
     Description: Base URL of the HTTP API (VITE_API_URL)
     Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
   SiteUrl:
-    Condition: HasCloudFront
+    Condition: HasSite
     Description: Public URL of the frontend
-    Value: !Sub "https://${Distribution.DomainName}"
+    Value: !If
+      - HasCloudFront
+      - !Sub "https://${Distribution.DomainName}"
+      - !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  SiteHosting:
+    Value: !Ref SiteHosting
   SiteBucketName:
     Condition: HasCloudFront
     Value: !Ref SiteBucket

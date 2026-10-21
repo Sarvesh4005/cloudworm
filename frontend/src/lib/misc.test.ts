@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ApiError, createApi } from "./api";
+import { ApiError, createApi, resolveApiBase } from "./api";
 import { safeFileName } from "./download";
 import { describeError } from "./errors";
 import { formatBytes, formatHoursOption, formatTimeLeft } from "./format";
@@ -50,6 +50,14 @@ describe("api client", () => {
     expect(url).not.toContain("secret-token");
     expect((init.headers as Record<string, string>)["x-owner-token"]).toBe("secret-token");
     expect(init.credentials).toBe("omit");
+  });
+
+  it("supports same-origin mode for SiteHosting=api", () => {
+    expect(resolveApiBase("same-origin", "https://abc.execute-api.ap-south-1.amazonaws.com")).toBe(
+      "https://abc.execute-api.ap-south-1.amazonaws.com",
+    );
+    expect(resolveApiBase("https://api.test")).toBe("https://api.test");
+    expect(resolveApiBase(undefined)).toBe("");
   });
 
   it("refuses to run without a configured base URL", async () => {

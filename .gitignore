@@ -7,6 +7,7 @@ __pycache__/
 # Node
 frontend/node_modules/
 frontend/dist/
+backend/site/dist/
 
 # Env files (examples are committed, real ones are not)
 .env
